@@ -1,0 +1,627 @@
+---
+title: "Cyclist Counts at Manhattan Bridge in New York City"
+author: "Anonymous"
+date: "12/6/2020"
+output:
+   pdf_document:
+     fig_caption: yes
+     toc: yes
+     toc_depth: 1
+     latex_engine: xelatex
+---
+# Load library and data
+```{r results = "hide", message = FALSE}
+library(rstan)
+library(ggplot2)
+library(tidyr) 
+library(dplyr)
+library("bayesplot")
+library(grid)
+library(brms) # for modelling data
+library(loo) # for loo-cv use
+library(MASS) # for boxplot 
+install.packages("weathermetrics")
+library(weathermetrics) # for temp conversion
+
+# load data used for project 
+mah_bikes <- read.csv("mah_bike_counts.csv") 
+rstan_options(auto_write = TRUE)
+
+# detect core for optimize stan computing
+options(mc.cores = parallel::detectCores())
+```
+
+
+# 1. Introduction
+
+Inspired by the BDA course in which we have learned how to use different modeling methods to model data, as well as evaluating which model best fits the data, especially in regression modelling. We are interested in count data modelling and variable of interest and would like to apply what we have learned in the course into this project. We will use regression modelling and  for count data type, Poisson observation models can be used for count values prediction and covariates analysis. 
+
+The hypothesis that we are trying to measure in this project is the effect of rainfall observed on Manhattan bridge at New York city on the frequency of cyclists. For this problem, the regression modelling is discussed and presented to estimate various features including temperature and the day of the week. Below is the figure that indicates the number of people cycling on the Manhattan bridge on weekdays.
+
+```{r}
+mah_bikes$weekday <- factor(mah_bikes$weekday, levels=c('Sunday', 'Monday',
+                    'Tuesday','Wednesday','Thursday','Friday','Saturday'))
+boxplot(Mah_count~weekday, xlab="Weekday", ylab="Count", data=mah_bikes)
+```
+Number of bikes crossing Manhattan bridge by day in New York City from April to October in 2017
+
+Based on the counts given on days, we are both interested in predicting the number of cyclists using the BDA process, and some motivated questions that we are going to discuss:
+
++ How many bicycles cross into and out of Manhattan per day?
+
++ How strongly do the weather conditions affect bike volumes in the road?
+
+# 2. Data Description
+
+The data were first obtained from Kaggle $[1]$ website and after we realized that the data contain only values of April data, we took another fixed version from here $[2]$, it actually was modified and written into a csv file to include all available months (April to October 2017) from this source $[3]$. The data have been previously used in some online tutorials, however we focus on a different response variable (Manhattan bridge) and also use different models for that. We also analyze if weather conditions have great influences on the number of crossing bikes through Manhattan bridges and if it does, how is the influence. The following figure summarizes the data we are going to explore.
+
+```{r}
+bikes_raw <- read.csv("bike.csv", header=T, stringsAsFactors=F)
+summary(bikes_raw)
+head(bikes_raw)
+```
+
+Based on above data summary and the first five rows from the observations, the dataset has 10 columns including 5 decimal, 3 integer, and 2 datetime data types, which includes:
+
++ High Temperature: is the maximum daily temperature in F. 
+
++ Low Temperature: is the minimum daily temperature in F.
+
++ Precipitation: is an amount of metric measuring atmospheric water vapor.
+
++ Brooklyn Bridge: occurences of bikes crossing Brooklyn bridge.
+
++ Manhattan Bridge: occurences of bikes crossing Manhattan bridge.
+
++ Williamsburg Bridge: occurences of bikes crossing Williamsburg bridge.
+
++ Queensboro Bridge: occurences of bikes crossing Queensboro bridge.
+
++ Total: is the total of occurrences of bicycle events
+
++ Date: is the day of the year
+
++ Day: is the day of the week
+
+For this project, we are only focusing on the cyclist counts on Manhattan Bridge, the other variables from different bridges are omitted from the dataset for ease of computation and analysis.Furthermore, there are multiple values in the Precipitation which is not numeric, and this can be seen by head() function in R required to be in the data cleaning. Some of these special values are 0.47 (S) and T, and they are replaced with 0. The word T is used to describe a very small amount of precipitation that results in no measurable increase. 
+
+## 1.1 Preprocessing data
+```{r results = "hide", message = FALSE}
+
+bikes <- data.frame(bikes_raw[c('Day','High.Temp...F.','Low.Temp...F.',
+                                'Precipitation','Manhattan.Bridge')])
+
+# remove "," in count character type
+bikes$Manhattan.Bridge <- gsub(",","",bikes$Manhattan.Bridge)
+
+# change F -> Celsius degree 
+bikes$High.Temp...F. <- fahrenheit.to.celsius(bikes$High.Temp...F., 2)
+bikes$Low.Temp...F. <- fahrenheit.to.celsius(bikes$Low.Temp...F., 2)
+
+names(bikes) <- c('weekday','hightemp','lowtemp','precip','Mah_count')
+bikes <- transform(bikes, Mah_count=as.numeric(Mah_count))
+
+head(bikes)
+
+na.zero <- function (x) {
+    x[is.na(x)] <- 0
+    return(x)
+}
+
+get.snow <- function(x) {
+  result <- 0
+  if (grepl('(S)',x)){
+    result <- as.double(gsub("[^0-9.-]", "", x))
+  }
+  return(result)
+}
+
+mah_bikes <- within(bikes, precip_rain<-as.double(precip))
+
+#bikes$precip_rain <- as.double(bikes$precip)
+
+# subtitute na by zero
+mah_bikes$precip_rain <- na.zero(mah_bikes$precip_rain)
+
+# return S (snow) with value and create new column from precipation
+mah_bikes$precip_snow <- lapply(mah_bikes$precip, get.snow)
+mah_bikes$precip_snow <- as.numeric(mah_bikes$precip_snow)
+
+mah_bikes$precip_snow <- NULL
+
+mah_bikes <- data.frame(mah_bikes[c('weekday','hightemp',
+                                    'lowtemp','precip_rain','Mah_count')])
+
+# convert weekday to categorical variables.
+mah_bikes$weekday <- as.factor(mah_bikes$weekday)
+
+```
+## 1.2 data post-processing
+```{r}
+summary(mah_bikes)
+```
+
+The weekday feature has been discussed in the Introduction section of the report regarding the number of cyclists, the next variable “Precipitation” is inspected with the maximum and minimum are 0 and 1.65 respectively. However, the third quantile of the Precipitation column is around 0.04, which shows there are some outliers in this variable. The data after cleaning shows a linear relationship between the precipitation levels and the total bike crossing on Manhattan bridge displayed in the below plot with the additional Poisson model for the regression line [4].
+
+```{r}
+ggplot(mah_bikes, aes(x = precip_rain, y = Mah_count)) +
+  geom_point() +
+  geom_smooth(method = 'glm', method.args = list(family = 'poisson')) +
+  ggtitle("Effect of Precipitation on Number of Cyclists on Manhattan Bridge ")
+```
+
+```{r}
+ggplot(mah_bikes, aes(x = hightemp, y = Mah_count)) +
+  geom_point() +
+  geom_smooth(method = 'glm', method.args = list(family = 'poisson')) +
+  ggtitle("Effect of High Temperature on Number of Cyclists on Manhattan Bridge ")
+```
+
+```{r}
+ggplot(mah_bikes, aes(x = lowtemp, y = Mah_count)) +
+  geom_point() +
+  geom_smooth(method = 'glm', method.args = list(family = 'poisson')) +
+  ggtitle("Effect of Low Temperature on Number of Cyclists on Manhattan Bridge ")
+```
+
+From above plots, it is observable that there is probably a chance that the observations are linear relationships, thus yielding the Poisson model. Moreover, the boxplot and linear regression model suggests that the observations are oddly distributed and the skewness of the histogram could be a sign of an overdispersed Poisson. Therefore, we plan to use at least two models such as simple Poisson regression and negative binomial regression for estimating overdispersion of data.
+
+For the predictors, we are going to use High temperature, Low temperature, Precipitation as independent variables for the BDA process with different models.
+
+
+# 3. Model description
+
+In this project, we are considering using the regression models to estimate the strength indications or prediction of the relationship between independent variables and an dependent output variable (number of bikes crossing Manhattan bridge). Thus, these models would predict the outcome for the new input that it has not seen in the observation data [6].
+
+For the regression models, here are the types we are going to implement:
+
++ Linear Regression
+
++ Poisson Regression
+
++ Negative Binomial Regression
+
+For the given data described in previous section (Data Description), the  authors decide to use linear Gaussian, Poisson and negative bionomial regressions as the main models for testing experiments and analyzing predictive posteriors. On the other hand, the nonlinear Poisson regression model using Gaussian Process are added as an extra for testing purpose in this project.
+
+For the linear Gaussian model, the mathematical notation is as follows:
+
+$$y_i \sim N(\mu_i, \sigma^2)$$
+
+$$\mu_i = \beta_0 + \beta_1*x_i$$ 
+
+where $x_i$ is the matrice of all covariates values and $\beta_1$ denotes coefficients of covariates
+
+$\sigma \sim student-t(\nu_0, \mu_0, \sigma_0)$ (Gaussian family's residual standard deviation)
+
+$\beta_0 \sim student-t(\nu, \mu, \sigma)$ (weakly informative prior)
+
+$beta_1 \sim N(\mu1, \sigma_1)$ (weakly informative prior)
+
+
+Poisson regression is a member of the generalized linear model (GLM) family, it models a non-negative integer response based on a linear predictor with a bridge of a specific link function. We use Poisson regression for several reasons. First of all, our data have response variable (number of cyclists on Manhatan) that are countable, these count data count the number of times covid cases are confirmed per week. Secondly, the mean of the Poisson distribution is positive which yields reasonable values of the number of bicycle count. Lastly, we have very limited knowledge in this field and did not have sufficient time to explore further implementation such as using an autoregressive model which is probably a good choice for time series data or non-linear observations.
+
+For the linear Poisson regression model, the mathematical notation is as follows [7]:
+
+$y_{i} \sim Po(\lambda_{i})$ (response distribution) 
+
+$log(\lambda_i) = \eta_{i}$ (link function)
+
+$\eta_i = \beta_0 + \beta_1*x_i$ (linear predictor) 
+
+where $x_i$ is the matrice of all covariates values and $\beta_1$ denotes coefficients of covariates\
+
+$\beta_0 \sim student-t(\nu, \mu, \sigma)$ (weakly informative prior)
+
+$beta_1 \sim N(\mu_1, \sigma_1)$ (weakly informative prior)
+
+From the equation above, the covariates are included to improve the fit and posterior predictive distribution slightly closer to the data distribution. Additionally, the zero-value part or the column that contain a lot of zero values is not accounted for the fitted dataset.
+
+On the other hand, the negative binomial regression is tested to estimate the cases usually for overdispersion on the outcome variables $[8]$. The negative binomial distribution follows:
+
+$$y_i\sim NegBinomial2(\mu_i,\phi)$$
+where 
+
+$$\mu_i\sim \frac{1}{1+\exp^{-n_i}}$$
+
+$$n_i=x_i\beta$$
+The negative binomial distribution above is defined with $\mu$ is the position variable, where $\phi$ is the reciprocal overdispersion variable, so that the variance of the cases ycan be captured sufficiently $[9]$. The expected mean and variance of the model is computed:
+
+$$E[y]=\mu$$
+
+$$V[y]=\mu+\frac{mu^2}{\phi}$$
+
+The speciality of this distribution is when the $\phi$ value (which is dispersion metric) goes to infinity, the model becomes Poisson distribution with both expected mean and variance is the same, otherwise, the variance goes to infinity if the dispersion value approaches zero.
+
+# 4. Informative or weakly informative priors, and justification of their choices.
+For these presented models above, the weakly informative priors are used to regularize inferences and test experiments with different scales for reasoning about the problems. With proper tuning or prior selections, the model can provide sufficient information to regularize posteriors from likelihoods that are non-identified or weakly-identified without strongly biasing about data. 
+
+During the exploratory data analysis process, we have tried a certain number of priors, we use weakly informative priors for these linear regression models.
+
+## 4.1 Gaussian model
+
+Intercept ~ student-t (3, 5132, 2161,6)
+
+sigma ~ t(3, 0, 2161,6)
+
+All covariates except weekday which is not applied the prior distribution
+
+We use student-t with for sigma since the sigma is constrained to be non-negative. For intercept, student-t distribution with tail that disappear quickly is a good choice in this case.
+
+For all other covariates, We use very Weakly informative prior: normal(0, 10)
+
+## 4.2 Poisson model
+
+Weakly informative prior Intercept ~ student-t(3, 8.5, 2.5). 
+
+For all other covariates, We use very Weakly informative prior: normal(0, 10).
+
+## 4.3 Negative binomial model
+
+Weakly informative prior with Intercept ~ student-t(3, 8.5, 2.5) and shape ~ gamma(0.01, 0.01)
+
+For all other covariates, We use very Weakly informative prior: normal(0, 10). 
+	
+# 5. Stancode
+Here the brm package is used instead of Stan since Stan model takes longer time compilation and complex data structure is required. On the other hand, brm works well for small chunks of data and it is easily implemented with appropriate model function and suitable for testing purposes.
+
+## 5.1 Gaussian model
+
+The Gassuain model is generated using brm package with make_stanecode() function:
+
+```{r}
+sm1 <- make_stancode(Mah_count ~ .,
+                     family = gaussian(),
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                               set_prior("normal(0,10)", coef="lowtemp"),
+                               set_prior("normal(0,10)", coef="precip_rain")
+                               ),
+                     )
+
+sm1
+```
+
+The comments generated by "make_stancode" function are already quite clear, we just would like to emphaize that in Gaussian model, we have extra sigma/ residual standard devisation prior. 
+
+## 5.2 Poisson model
+
+The Poisson model is generated using make_stancode() function as followed:
+
+```{r}
+sm2 <- make_stancode(Mah_count ~ .,
+                     family = poisson(link=log),
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                               set_prior("normal(0,10)", coef="lowtemp"),
+                               set_prior("normal(0,10)", coef="precip_rain")
+                               ),
+                    )
+sm2
+```
+
+In Poisson stancode, we have a vector of all covarate (except the count) priors name b the other prior is Intercept.
+
+## 5.3 Negative binomial model
+
+Again, for the negative binomial regression model is generated by the same function with correspoinding weakly informative prior:
+
+```{r}
+sm3 <- make_stancode(Mah_count ~ .,
+                     family = "negbinomial",
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                               set_prior("normal(0,10)", coef="lowtemp"),
+                               set_prior("normal(0,10)", coef="precip_rain")
+                               ),
+                    )
+sm3
+```
+
+The stancode for Negative binomial molde is just a bit different from Poisson model, it has one more parameter which name is "shape"
+
+# 6. How the stancode was run
+
+We use only function “brm” from the package “brms” to fit all three models $[12]$ with core=4, chain length = 2000 and 4 chains, with warm-up is 50% of chain length. We also seed to 1 for fixed result and refresh=0 for not showing the whole compile process.
+The Formula used to fit with "brm" is $count \sim covariates$ (covariates are weekday, low temp, hight temp,rain precipation)
+
+## 6.1 Gaussian model run
+
+Here is how the Gaussian model run using R code:
+
+```{r results = "hide", message = FALSE}
+fit1 <- brm(Mah_count ~ .,
+            family = gaussian(),
+            data = mah_bikes,
+            prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                    set_prior("normal(0,10)", coef="lowtemp"),
+                    set_prior("normal(0,10)", coef="precip_rain")
+                    ),
+            seed = 1,
+            refresh = 0,
+            )
+```
+
+Here is how the Poisson model implemented in R:
+
+## 6.2 Poisson model run
+```{r results = "hide", message = FALSE}
+fit2 <- brm(Mah_count ~ .,
+            family = poisson(link = log),
+            data = mah_bikes,
+            prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                    set_prior("normal(0,10)", coef="lowtemp"),
+                    set_prior("normal(0,10)", coef="precip_rain")
+                    ),
+            seed = 1,
+            refresh = 0,
+            )
+```
+
+In Poisosn model, we use logarit to be link function between $\eta$ and paramter rate $\lambda$
+
+## 6.3 Negative binomial model run
+
+```{r results = "hide", message = FALSE}
+fit3 <- brm(Mah_count ~ .,
+                     family = "negbinomial",
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                              set_prior("normal(0,10)", coef="lowtemp"),
+                              set_prior("normal(0,10)", coef="precip_rain")
+                              ),
+                     seed = 1,
+                     refresh=0)
+```
+
+# 7. Convergence diagnostics ( R, ESS, divergences)
+	
+Basic idea of $\hat(R)$ is to diagnose the convergence of MCMC algorithm, by checking mixing and stationarity. $\hat(R)$ from the result generated by bms fit function was used in this project, it diagnoses the convergence by comparing it between and within-chain estimates of alpha, and later for beta. If chains have not mixed well then R_hat > 1. According to documentation, using 4 chains is recommended and R_hat < 1.05 is acceptable for using the samples. In our project, we have obtained good $\hat(R)$ values and they are all 1.0 in three models and no further tunings need to be done. We use 4 chains and each chain with the length of 2000 iterations, each warm-up length is 1000 iterations.
+
+Important sampling effective sample size (ESS) represents the quantitative measure of the quality of the estimated mean (or how well the proposal distribution q match the target distribution p). In other words, it helps defining the loss of eﬀiciency, answer the question does W weighted samples have effect as the T (initial choice of sample size). 
+
+From the following MCMC chains and posterior distributions, the algorithm estimates quite well the posterior distribution of parameters.
+
+The model convergence can be analyzed by visually examining the plots using the traceplots() of RStan code or plot() of brms function. Thus, the chains should be fuzzy or they are overlapping with others, so it can define whether the model or chains have converged. Another metric to define the goodness of the model or the convergence is the Rhat value, so the Rhat value observed from the summary of model shows that 1 is a good sign where the values < 1.05 could cause the model to diverge and the parameters of the model needs to be reconfigured again.
+
+From the plots generated by traceplots(), it can be seen that there are some overlaps in the chains and this identifies that the chains have converged. In addition to this, the next useful thing to understand thesưe models is performing posterior predictive checks which are presented in the next section.
+
+## 7.1 Gausisan model
+
+Here we are going to run traceplots and check the R values for the Gaussian regression model:
+
+```{r, fig.width=8, fig.height=8}
+summary(fit1) # Summarize the Gaussian model
+plot(fit1, pars = c("lowtemp", "hightemp", "precip_rain", 
+                    "Intercept", "sigma")) # Plot the traceplots of the model
+```
+
+"Both bulk-ESS and tail-ESS should be at least 100 (approximately) per Markov Chain in order to be reliable and indicate that estimates of respective posterior quantiles are reliable". We have 4 chains, hence all values we got seems to be reliable.
+
+
+## 7.2 Poisson model
+
+Here we are going to run traceplots and check the R values for the Poisson regression model:
+
+```{r, fig.width=8, fig.height=8}
+summary(fit2) # Summarize the Poisson model
+plot(fit2, pars = c("lowtemp", "hightemp", "precip_rain",
+                    "Intercept")) # Plot the traceplots of the model
+```
+
+## 7.3 Negative binomial model
+
+Here we are going to run traceplots and check the R values for the Negative binomial regression model:
+
+```{r, fig.width=8, fig.height=8}
+summary(fit3) # Summarize the Negative binomial model
+plot(fit3, pars = c("lowtemp", "hightemp", "precip_rain", 
+                    "Intercept", "shape")) # Plot the traceplots of the model
+```
+
+Looking at three traceplots for different regression models, the R-hat values are all less than 1.05 which indicates that the goodness of the model are able to sample or estimate the posterior distribution. 
+
+# 8. Posterior predictive check
+
+The posterior predictive check (PPC) is an effective method to validate a model efficiency by drawing generated data from the parameterized models of the posterior distribution. The PPC analyzes the difference or gap between the generated data from the model compared to observed data from the true distribution. In our experiments, It seems that the Gausisan linear model does not predict well the data. 
+
+## 8.1 Gaussian model
+
+Firstly, the predictive posterior check is applied to Gaussian model: 
+
+```{r}
+pp_check(fit1,nsamples = 30)
+```
+
+## 8.2 Poisson model
+
+Secondly, the predictive posterior check implemented in R code:
+
+```{r}
+pp_check(fit2,nsamples = 30)
+```
+
+## Negative binomial model
+
+Lastly, the negative binomial regression model is check with predictive posteriors:
+
+```{r}
+pp_check(fit3,nsamples = 30)
+```
+It seems that the linear Poisson model does not predict well the data, while the others including Gaussian and Negative binomial regression models are good to fit with the observed data since two histograms of the predictive and posterior distribution are plotted to observe how well the model fitted with the raw data.
+
+# 9. Model comparison (e.g. with LOO-CV)
+
+The loo package is applied to these models to perform Pareto smoothed importance-sampling leave-one-out-cross-validation (PSIS-LOO) for these models. The purpose of this package is to visualize the estimated pointwise log-likelihood values if they are in the range $\hat{k} \leq 0.7$. Furthermore, the package also provides warnings about the Pareto diagnostics which shows that some observations from the dataset are left out to see if the importance sampling of the model is able to reduce the difference. From this metric and the result shown in the figures, we can indicate and compare if the models are good to fit with the data if the Pareto k values are less than 7, while the model cannot provide a useful estimate for the observed data or it indicates the potential model misspecification if the k values are greater than 7.
+
+## 9.1 Gaussian model
+
+```{r}
+loo1 <- loo(fit1)
+loo1
+```
+
+## 9.2 Poisson model
+
+```{r}
+loo2 <- loo(fit2)
+loo2
+```
+
+## 9.3 Negative binomial model
+```{r}
+loo3 <- loo(fit3)
+loo3
+```
+
+## 9.4 Compare theree models
+
+```{r}
+loo_compare(loo1, loo2, loo3)
+```
+
+Obviously Poisosn model should not be taken since it has a very large number of k values > 0.7. Other models have good loo result.\
+Based on the help of loo_compare() function, the values indicate that if the differences are larger than 4, the number of sampling posteriors are 100 times larger. Thus, if that model is not misspecified, the larger model shows reiliable description for the SE and normal approximation values in model difference, whereas when the values are less than 4, this means the models have similar effect in sampling posterior distribution and it does not consider the value of SE if it fails $[13]$.\
+From the given results, elpd_loo in the model 3 / negative binomial is largest and can be trusted (the distance between fit1 and fit3 also larger than 4). Hence we decide to use this model for the following requirements.
+
+# 10. Predictive performance assessment if applicable (e.g. classification accuracy) and evaluation of practical usefulness of the accuracy.
+
+To perform the predictive performance assessment,we use the last 7 days record of the data.
+
+```{r results = "hide", message = FALSE, fig.width=8, fig.height=8} 
+# extract value of last week
+new_data <- head(mah_bikes, length(mah_bikes$Mah_count) - 7)
+# fit the negative binomial  model again with selected priors
+fit3_new <- brm(Mah_count ~ .,
+                     family = "negbinomial",
+                     data = new_data,
+                     prior = c(set_prior("normal(0,10)", coef="hightemp"),
+                              set_prior("normal(0,10)", coef="lowtemp"),
+                              set_prior("normal(0,10)", coef="precip_rain")
+                              ),
+                     seed = 1,
+                     refresh=0)
+
+test_data <- tail(mah_bikes, 7)
+Mah_count_true <- test_data$Mah_count
+cat('True value from observation', Mah_count_true)
+test_data$Mah_count <- NULL
+
+# Check predictive response based on new fit model
+pred <- predict(fit3_new, newdata=test_data )
+print('\npredictive values:')
+print(pred)
+```
+As can be seen from the above result, our model predicts quite well when the real values fall into the 95% credible interval. (It's better to have a plot for this but we ran oun of time and have to be happy with this, our apologies.)
+
+# 11. Sensitivity analysis with respect to prior choices (i.e. checking whether the result changes a lot if prior is changed)
+
+```{r results = "hide", message = FALSE, fig.width=8, fig.height=8} 
+#With priors: Intercept ~ t(3, 8.5, 2.5) and shape ~ gamma(0.01, 0.01)
+plot(fit3, pars = c("lowtemp","hightemp","precip_rain", "Intercept", "shape"))
+pp_check(fit3,nsamples = 30)
+
+# With priors : Intercept ~ N(0,5) and shape ~ gamma(1,1)
+fit3_1 <- update(fit3, prior = c(set_prior("normal(0,5)", class="Intercept"),
+                               set_prior("gamma(0.01,0.01)", class="shape"),
+                               set_prior("normal(0,100)", coef="hightemp"),
+                               set_prior("normal(0,100)", coef="lowtemp"),
+                               set_prior("normal(0,100)", coef="precip_rain")))
+plot(fit3_1, pars = c("lowtemp","hightemp","precip_rain", "Intercept", "shape"))
+pp_check(fit3,nsamples = 30)
+
+# With priors: Intercept ~ N(0,100) and shape ~ gamma(0.01, 0.01):
+fit3_2 <- update(fit3, prior = c(set_prior("normal(0,100)", class="Intercept"),
+                               set_prior("gamma(1,1)", class="shape"),
+                               set_prior("normal(0,1)", coef="hightemp"),
+                               set_prior("normal(0,1)", coef="lowtemp"),
+                               set_prior("normal(0,1)", coef="precip_rain")))
+
+plot(fit3_2, pars = c("lowtemp","hightemp","precip_rain", "Intercept", "shape"))
+pp_check(fit3,nsamples = 30)
+```
+As can be seen from the above figures, it seems that the shape of posteriors is quite robust to the change of priors. However, with the significant changes of parameter alpha and beta in gamma prior distribution of shape, it is observable that there is a shift of posterior distribution of shape toward the left. 
+
+
+```{r results = "hide", message = FALSE, fig.width=8, fig.height=8} 
+# With priors: Intercept ~ N(0,100) and shape ~ gamma(0.01, 0.01):
+fit3_3 <- update(fit3, prior = c(set_prior("normal(0,100)", class="Intercept"),
+                               set_prior("gamma(1,1)", class="shape"),
+                               set_prior("normal(23,10)", coef="hightemp"),
+                               set_prior("normal(17,12)", coef="lowtemp"),
+                               set_prior("normal(0,0.1)", coef="precip_rain")))
+
+plot(fit3_3, pars = c("lowtemp","hightemp","precip_rain", "Intercept", "shape"))
+
+
+```
+
+```{r results = "hide", message = FALSE, fig.width=8, fig.height=8} 
+plot(fit3_3, pars = c("lowtemp","hightemp","precip_rain", "Intercept", "shape"))
+```
+
+# 12. Discussion of issues and potential improvements.
+
+We had to change data so in a hurry time we could not do more experiments. At this point, there are some potential improvements we have thought about, this requires more observations, more expert knowledge prior seek, using auto regressive model for the data because of its time series nature and using approximate Leave-future-out cross-validation (LFO-CV) for the auto regressive model.
+
+Furthermore, more experiments can be tested with different priors if the machine has a more powerful computation process. We face limited time on testing different priors for the non-linear gaussian process Poisson (which is not done yet) due to its complexity and heavy tasks. Thus, different and simple non-linear models could be considered to capture the variance and estimate the cyclists crossing the bridge.
+
+# 13. Conclusion
+
+In this project, we have gone through many types of data before deciding which one to proceed further, we also had to change the data two times and this is an important note for us for future data analysis.
+
+Firstly, we have learned that chosen data have to be coped with our current understanding of data type, the number of covariates as well as the level of difficulty. 
+
+Secondly, we also obtain a certain understanding of using different libraries that are used for data preprocessing and data analysis in R. More specifically, we learned to use the “brms” package to model the data with different approaches, with different settings in priors and parameters. 
+
+Thirdly, we have learned about sensitivity analysis with different chosen priors and perceive the importance of prior, especially expert knowledge of prior in Bayesian data analysis. 
+
+# 14. Self-reflection of what the group learned while making the project.
+
+In this project, we have learned how to fit the count data with Stan models using mostly brms packages to estimate the number of cyclists crossing on Manhattan bridge. Moreover, we also had to implement the data analysis with different packages such as rstanarm (which is not allowed in this project) and stan models in order to have a brief understanding on how things were implemented under the hood. Also, most of the Poisson regression examples on the internet are analyzed using different packages. From that, we gain more understanding on how the Stan model is constructed and have found efficient code approaches.
+
+Furthermore, the discrete case data are explored with Gaussian linear, Negative binomial, Poisson regression in both linear and nonlinear (with Gaussian process - too slow to compile, so we omit it here) approaches. For the linear model, we have learned that it needs more informative priors to tune the model for better data fitting and data prediction. For the nonlinear model, we have learned about the Gaussian process which has proved to be a very powerful approach for random variable modelling but trade-off with heavy computing. 
+
+# 15. References
+
+$[1]$ Department of Transportation. (2019, April). Bicycle Counts for East River Bridges, Version 1. Retrieved Retrieved December 4, 2020 from https://www.kaggle.com/new-york-city/nyc-east-river-bicycle-crossings.
+
+
+$[2]$ https://storage.googleapis.com/kaggle-forum-message-attachments/766012/14989/NYC_Bicycle_Counts_2016_Corrected.csv
+
+
+$[3]$ Department of Transportation. (2019, April). Bicycle Counts for East River Bridges, Version 2. Retrieved Retrieved December 4, 2020 from https://data.cityofnewyork.us/Transportation/Bicycle-Counts-for-East-River-Bridges/gua4-p9wg.
+
+
+$[4]$ Bates D, M¨achler M, Bolker B, Walker S (2015). “Fitting Linear Mixed-Effects Models Using lme4.” Journal of Statistical Software, 67(1), 1–48.
+
+
+$[5]$ Burkner PC (2017). “brms: An R Package for Bayesian Multilevel Models using Stan.” ¨ Journal of Statistical Software, 80(1), 1–28. doi:10.18637/jss.v080.i01.
+
+
+$[6]$ Long, J. S. and Freese, J. 2006. Regression Models for Categorical Dependent Variables Using Stata, Second Edition. College Station, TX: Stata Press.
+
+
+$[7]$ Cameron, A. C. and Trivedi, P. K. 1998. Regression Analysis of Count Data. New York: Cambridge Press, UK, 1998.
+
+
+$[8]$ Hilbe, J. M. Negative Binomial Regression. Cambridge University Press, 2007.
+
+
+$[9]$ Gelman A. (2006). Prior distributions for variance parameters in hierarchical models. Bayesian analysis, 1(3), 515 -- 534.
+
+
+$[10]$ Bradlow, E. T., Hardie, B. G. S., and Fader, P. S.Bayesian inference for the negative binomial distribution via polynomial expansions. Jour
+
+
+$[11]$ Chib, S, Greenberg, E, and Winkelmann, R. Posterior simulation and Bayes factors in panel count data models. Journal of Econometrics, 1998.
+
+
+$[12]$ Burkner PC (2017). “brms: An R Package for Bayesian Multilevel Models using Stan.” ¨ Journal of Statistical Software, 80(1), 1–28. doi:10.18637/jss.v080.i01.
+
+
+$[13]$ Gabry J, Goodrich B (2016). rstanarm: Bayesian Applied Regression Modeling via Stan. R package version 2.9.0-3, URL https://CRAN.R-project.org/package=rstanarm.
+
+
+
+
+
