@@ -1,0 +1,278 @@
+---
+title: "bike"
+author: "Anonymous"
+date: "12/4/2020"
+output:
+   pdf_document:
+     toc: yes
+     toc_depth: 1
+     latex_engine: xelatex
+---
+
+
+# load library
+```{r results = "hide", message = FALSE}
+# load packages
+#library(aaltobda)
+library(rstan)
+library(ggplot2)
+library(tidyr) 
+library(dplyr)
+library("bayesplot")
+library(grid)
+library(brms)
+library(loo)
+library(weathermetrics)
+# load data
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+
+
+
+##  Preprocesing data
+```{r}
+
+bikes_raw <- read.csv("bike.csv", header=T, stringsAsFactors=F)
+
+#bike <- head(bike, 100) # select on 100 records to ease computing
+#bike <- transform(bike, Total=as.numeric(Total))
+
+bikes <- data.frame(bikes_raw[c('Day','High.Temp...F.','Low.Temp...F.', 'Precipitation','Manhattan.Bridge')])
+
+# remove "," in count character type
+bikes$Manhattan.Bridge <- gsub(",","",bikes$Manhattan.Bridge)
+
+# change F -> Celsius degree 
+bikes$High.Temp...F. <- fahrenheit.to.celsius(bikes$High.Temp...F., 2)
+bikes$Low.Temp...F. <- fahrenheit.to.celsius(bikes$Low.Temp...F., 2)
+
+names(bikes) <- c('weekday','hightemp','lowtemp','precip','Mah_count')
+bikes <- transform(bikes, Mah_count=as.numeric(Mah_count))
+
+bikes <- head(bikes, 100)
+
+head(bikes)
+
+na.zero <- function (x) {
+    x[is.na(x)] <- 0
+    return(x)
+}
+
+get.snow <- function(x) {
+  result <- 0
+  if (grepl('(S)',x)){
+    result <- as.double(gsub("[^0-9.-]", "", x))
+  }
+  return(result)
+}
+
+mah_bikes <- within(bikes, precip_rain<-as.double(precip))
+
+#bikes$precip_rain <- as.double(bikes$precip)
+
+# subtitute na by zero
+mah_bikes$precip_rain <- na.zero(mah_bikes$precip_rain)
+
+# return S (snow) with value and create new column from precipation
+mah_bikes$precip_snow <- lapply(mah_bikes$precip, get.snow)
+mah_bikes$precip_snow <- as.numeric(mah_bikes$precip_snow)
+
+mah_bikes <- data.frame(mah_bikes[c('weekday','hightemp','lowtemp','precip_rain','precip_snow','Mah_count')])
+
+# convert weekday to categorical variables.
+mah_bikes$weekday <- as.factor(mah_bikes$weekday)
+head(mah_bikes)
+
+```
+
+## Plot observation
+```{r}
+
+# plot scatter
+ggplot() +
+  geom_point(aes(weekday, Mah_count), data = mah_bikes, size = 1) +
+  labs(y = "Bikes", x= "week day", title ="Bycicle cross Mahattan by day") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  guides(linetype = F)
+
+# with smooth line
+#plot(covid_linear$Week, covid_linear$Cases, main="Covid cases by week and smooth line", xlab="Week", ylab="Cases")
+#with(covid_linear, lines(lowess(covid_linear$Cases~covid_linear$Week)))
+
+```
+
+## saving processed data
+```{r}
+write.csv(mah_bikes, "mah_bike_counts.csv", row.names = F)
+```
+
+
+## plot boxplot
+```{r}
+library(MASS)
+mah_bikes$weekday <- factor(mah_bikes$weekday, levels=c('Sunday', 'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'))
+boxplot(count~weekday, xlab="Weekday", ylab="Count", data=mah_bikes)
+```
+
+# quantitative varaible
+```{r}
+mah_bikes_quant=data.frame(mah_bikes[c('hightemp','lowtemp','precip_rain','precip_snow','Mah_count')])
+plot(mah_bikes_quant)
+```
+# Fit by standard linear regression, it will not be a good fit, but for comparision
+```{r results = "hide", message = FALSE}
+fit1 <- brm(Mah_count ~ .,
+                     family = gaussian(),
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,1000)", class="Intercept"),
+                               set_prior("inv_chi_square(0.1)", class="sigma")),
+                     )
+summary(fit1)
+```
+## stan model 1
+```{r}
+sm1 <- make_stancode(Mah_count ~ .,
+                     family = gaussian(),
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,1000)", class="Intercept"),
+                               set_prior("inv_chi_square(0.1)", class="sigma")),
+                     )
+
+sm1
+```
+# Analyze posterior
+```{r}
+mcmc_areas(as.matrix(fit1), prob_outer = .999)
+```
+
+## predictive check
+```{r}
+loo1 <- loo(fit1)
+plot(loo1)
+pp_check(fit1,nsamples = 59)
+```
+# predict responses based on the fitted model
+```{r}
+head(predict(fit1))
+```
+
+# plot conditional effects for each predictor
+```{r}
+plot(conditional_effects(fit1), ask = FALSE)
+```
+
+# Plot the MCMC chains and posterior distribution
+```{r}
+plot(fit1)
+```
+
+# Fit linear poisson for mahattance bridge count
+```{r results = "hide", message = FALSE}
+
+fit2 <- brm(Mah_count ~ .,
+                     family = poisson(link=log),
+                     data = mah_bikes,
+                     #prior = c(set_prior("normal(0,10)", class="Intercept"), # doesn't work well
+                    #           set_prior("inv_chi_square(0.1)", class="b")), # doesn' work well
+                     prior = c(set_prior("normal(0,10)", class="Intercept"), # doesn't work well
+                               set_prior("normal(0,10)", class="b")), # doesn' work well
+                     )
+summary(fit2)
+
+```
+
+## stancode 
+```{r}
+#get_prior(Mah_count ~ .,family = poisson(link=log),data = mah_bikes)
+
+sm2 <- make_stancode(Mah_count ~ .,
+                     family = poisson(link=log),
+                     data = mah_bikes,
+                     #prior = c(set_prior("normal(1000,2000)", class="Intercept"),
+                    #           set_prior("normal(0,2)", class="b")),
+                     )
+
+sm2
+```
+
+## Analyze posterior
+```{r}
+mcmc_areas(as.matrix(fit2), prob_outer = .999)
+```
+
+## predictive check
+```{r}
+loo(fit2)
+pp_check(fit2,nsamples = 20)
+```
+
+## predict responses based on the fitted model
+```{r}
+head(predict(fit1))
+```
+
+## plot conditional effects for each predictor
+```{r}
+plot(conditional_effects(fit1), ask = FALSE)
+```
+
+## Plot the MCMC chains and posterior distribution
+```{r}
+plot(fit1)
+```
+
+# Fit Gaussian Process for mahattance bridge count
+```{r results = "hide", message = FALSE}
+
+fit2 <- brm(Mah_count ~ gp(.),
+                     family = poisson(link=log),
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(0,10)", class="Intercept"),
+                               set_prior("inv_chi_square(0.1)", class="b")),
+                     )
+summary(fit2)
+
+```
+
+## stancode 
+```{r}
+get_prior(Mah_count ~ .,family = poisson(link=log),data = mah_bikes)
+
+sm2 <- make_stancode(Mah_count ~ .,
+                     family = poisson(link=log),
+                     data = mah_bikes,
+                     prior = c(set_prior("normal(1000,2000)", class="Intercept"),
+                               set_prior("normal(0,2)", class="b")),
+                     )
+
+sm2
+```
+
+## Analyze posterior
+```{r}
+mcmc_areas(as.matrix(fit2), prob_outer = .999)
+```
+
+## predictive check
+```{r}
+loo(fit2)
+pp_check(fit2,nsamples = 20)
+```
+
+## predict responses based on the fitted model
+```{r}
+head(predict(fit1))
+```
+
+## plot conditional effects for each predictor
+```{r}
+plot(conditional_effects(fit1), ask = FALSE)
+```
+
+## Plot the MCMC chains and posterior distribution
+```{r}
+plot(fit1)
+```
+
